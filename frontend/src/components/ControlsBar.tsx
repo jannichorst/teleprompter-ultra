@@ -1,19 +1,20 @@
 import { Button } from "./ui/button";
 import { Slider } from "./ui/slider";
-import { Mic, MicOff, PlugZap, PlugZapOff, Plus, Minus } from "lucide-react";
+import { Mic, MicOff, Plus, Minus } from "lucide-react";
 
 interface ControlsBarProps {
   fontSize: number;
   onIncrease: () => void;
   onDecrease: () => void;
   onFontChange: (value: number) => void;
-  onConnect: () => void;
-  onDisconnect: () => void;
   onStartMic: () => void;
   onStopMic: () => void;
   connected: boolean;
   listening: boolean;
   status: string;
+  micDevice?: string;
+  micLevel?: number;
+  latency?: number | null;
 }
 
 export function ControlsBar({
@@ -21,14 +22,18 @@ export function ControlsBar({
   onIncrease,
   onDecrease,
   onFontChange,
-  onConnect,
-  onDisconnect,
   onStartMic,
   onStopMic,
   connected,
   listening,
   status,
+  micDevice,
+  micLevel = 0,
+  latency,
 }: ControlsBarProps) {
+  // Use normalized level directly (0-1, already normalized)
+  const micLevelPercent = Math.min(100, Math.max(0, micLevel * 100));
+
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/80 p-3">
       <div className="flex items-center gap-2">
@@ -49,26 +54,40 @@ export function ControlsBar({
         <span className="text-sm text-slate-400">{fontSize}px</span>
       </div>
       <div className="flex items-center gap-2">
-        {connected ? (
-          <Button onClick={onDisconnect} variant="outline">
-            <PlugZapOff className="mr-2 h-4 w-4" /> Disconnect
-          </Button>
-        ) : (
-          <Button onClick={onConnect} variant="outline">
-            <PlugZap className="mr-2 h-4 w-4" /> Connect
-          </Button>
-        )}
         {listening ? (
           <Button onClick={onStopMic}>
-            <MicOff className="mr-2 h-4 w-4" /> Stop mic
+            <MicOff className="mr-2 h-4 w-4" /> Stop transcription
           </Button>
         ) : (
-          <Button onClick={onStartMic}>
-            <Mic className="mr-2 h-4 w-4" /> Start mic
+          <Button onClick={onStartMic} disabled={!connected}>
+            <Mic className="mr-2 h-4 w-4" /> Start transcription
           </Button>
         )}
       </div>
-      <p className="ml-auto text-xs text-slate-400">Status: {status}</p>
+      {micDevice && (
+        <div className="flex items-center gap-2 text-xs text-slate-400">
+          <Mic className="h-3 w-3" />
+          <span className="max-w-[200px] truncate" title={micDevice}>
+            {micDevice}
+          </span>
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <div className="h-2 w-20 rounded-full bg-slate-800 overflow-hidden">
+          <div
+            className="h-full bg-slate-400 transition-all duration-300 ease-out will-change-[width]"
+            style={{ width: `${micLevelPercent}%` }}
+          />
+        </div>
+      </div>
+      <div className="ml-auto flex items-center gap-3">
+        {latency !== null && (
+          <span className="text-xs text-slate-400">
+            Latency: {latency}ms
+          </span>
+        )}
+        <p className="text-xs text-slate-400">Status: {status}</p>
+      </div>
     </div>
   );
 }
