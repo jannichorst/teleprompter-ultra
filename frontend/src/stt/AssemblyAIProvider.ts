@@ -20,7 +20,9 @@ export class AssemblyAIProvider implements SttProvider {
   private processor?: ScriptProcessorNode;
   private source?: MediaStreamAudioSourceNode;
   private audioBufferQueue: Int16Array = new Int16Array(0);
-  private turns: Record<number, string> = {};
+  private pendingTurns: Map<number, string> = new Map();
+  private nextTurnToDeliver = 0;
+  private transcriptSoFar = "";
   private isMonitoringOnly: boolean = false; // True when just monitoring, not sending to AssemblyAI
   private minLevel: number = Infinity; // For dynamic normalization
   private maxLevel: number = 0; // For dynamic normalization
@@ -110,13 +112,13 @@ export class AssemblyAIProvider implements SttProvider {
         // Use v3 endpoint with token parameter (matching the example)
         const endpoint = `wss://streaming.assemblyai.com/v3/ws?sample_rate=${SAMPLE_RATE}&token=${encodeURIComponent(token)}`;
         const socket = new WebSocket(endpoint);
+        socket.binaryType = "arraybuffer";
         this.ws = socket;
 
         let resolved = false;
         let connectionTimeout: number | undefined;
 
         socket.onopen = () => {
-          console.log("WebSocket connected to AssemblyAI!");
           if (!resolved) {
             resolved = true;
             if (connectionTimeout) clearTimeout(connectionTimeout);
@@ -128,57 +130,25 @@ export class AssemblyAIProvider implements SttProvider {
         socket.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
-            console.log("Parsed AssemblyAI message:", JSON.stringify(msg, null, 2));
-            
+
             if (msg.type === "Turn") {
               const { turn_order, transcript } = msg;
-              console.log("✅ Turn message received:", { turn_order, transcript });
-              
-              if (turn_order !== undefined && transcript) {
-                this.turns[turn_order] = transcript;
-
-                const orderedTurns = Object.keys(this.turns)
-                  .sort((a, b) => Number(a) - Number(b))
-                  .map((k) => this.turns[Number(k)])
-                  .join(" ");
-
-                console.log("📝 Calling transcript callback with ordered turns:", orderedTurns);
-                
-                // Calculate latency: time from oldest audio send to now
-                if (this.audioSendTimes.length > 0 && this.latencyCallback) {
-                  const receiveTime = Date.now();
-                  const oldestSendTime = this.audioSendTimes[0];
-                  const latency = receiveTime - oldestSendTime;
-                  this.latencyCallback(latency);
-                  // Clear processed send times
-                  this.audioSendTimes = [];
+              if (typeof turn_order === "number" && transcript) {
+                if (this.nextTurnToDeliver === 0) {
+                  this.nextTurnToDeliver = turn_order;
                 }
-                
-                if (this.transcriptCallback) {
-                  this.transcriptCallback(orderedTurns);
-                }
+
+                this.pendingTurns.set(turn_order, transcript);
+                this.flushTurns();
               } else if (transcript) {
-                console.log("📝 Calling transcript callback (no turn_order):", transcript);
-                
-                // Calculate latency: time from oldest audio send to now
-                if (this.audioSendTimes.length > 0 && this.latencyCallback) {
-                  const receiveTime = Date.now();
-                  const oldestSendTime = this.audioSendTimes[0];
-                  const latency = receiveTime - oldestSendTime;
-                  this.latencyCallback(latency);
-                  // Clear processed send times
-                  this.audioSendTimes = [];
-                }
-                
-                if (this.transcriptCallback) {
-                  this.transcriptCallback(transcript);
-                }
+                this.transcriptSoFar = transcript;
+                this.reportLatency();
+                this.transcriptCallback?.(transcript);
               }
             } else if (msg.type === "Begin") {
-              console.log("✅ Session began:", msg.id);
             } else if (msg.type === "Error") {
               const errorMsg = msg.error || "Unknown error";
-              console.error("❌ AssemblyAI error:", errorMsg, msg);
+              console.error("AssemblyAI error:", errorMsg, msg);
               this.status = "error";
               if (!resolved) {
                 resolved = true;
@@ -250,7 +220,9 @@ export class AssemblyAIProvider implements SttProvider {
       this.ws.close();
     }
     this.ws = undefined;
-    this.turns = {};
+    this.pendingTurns.clear();
+    this.nextTurnToDeliver = 0;
+    this.transcriptSoFar = "";
     this.status = "idle";
   }
 
@@ -275,8 +247,9 @@ export class AssemblyAIProvider implements SttProvider {
     
     this.audioContext = new AudioContext({
       sampleRate: SAMPLE_RATE,
-      latencyHint: 'balanced'
+      latencyHint: "interactive",
     });
+    await this.audioContext.resume();
 
     this.source = this.audioContext.createMediaStreamSource(this.stream);
     this.isMonitoringOnly = true;
@@ -390,7 +363,7 @@ export class AssemblyAIProvider implements SttProvider {
     } catch (error) {
       console.warn("AudioWorklet not available, falling back to ScriptProcessorNode", error);
       // Fallback to ScriptProcessorNode
-      this.processor = this.audioContext!.createScriptProcessor(4096, 1, 1);
+      this.processor = this.audioContext!.createScriptProcessor(1024, 1, 1);
       
       this.processor.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0);
@@ -447,8 +420,9 @@ export class AssemblyAIProvider implements SttProvider {
 
     const bufferDuration = (this.audioBufferQueue.length / this.audioContext!.sampleRate) * 1000;
 
-    if (bufferDuration >= 100) {
-      const totalSamples = Math.floor(this.audioContext!.sampleRate * 0.1);
+    if (bufferDuration >= 50) {
+      const targetDurationSeconds = 0.05;
+      const totalSamples = Math.floor(this.audioContext!.sampleRate * targetDurationSeconds);
       const finalBuffer = new Uint8Array(this.audioBufferQueue.subarray(0, totalSamples).buffer);
       this.audioBufferQueue = this.audioBufferQueue.subarray(totalSamples);
 
@@ -492,5 +466,42 @@ export class AssemblyAIProvider implements SttProvider {
     merged.set(lhs, 0);
     merged.set(rhs, lhs.length);
     return merged;
+  }
+
+  private reportLatency(): void {
+    if (this.audioSendTimes.length > 0 && this.latencyCallback) {
+      const sendTime = this.audioSendTimes.shift();
+      if (sendTime !== undefined) {
+        const latency = Date.now() - sendTime;
+        this.latencyCallback(latency);
+      }
+    }
+  }
+
+  private flushTurns(): void {
+    if (this.nextTurnToDeliver === 0) {
+      return;
+    }
+
+    let updated = false;
+
+    while (this.pendingTurns.has(this.nextTurnToDeliver)) {
+      const text = this.pendingTurns.get(this.nextTurnToDeliver);
+      if (text) {
+        this.transcriptSoFar = this.transcriptSoFar
+          ? `${this.transcriptSoFar} ${text}`
+          : text;
+        this.pendingTurns.delete(this.nextTurnToDeliver);
+        this.nextTurnToDeliver += 1;
+        updated = true;
+      } else {
+        break;
+      }
+    }
+
+    if (updated && this.transcriptCallback) {
+      this.reportLatency();
+      this.transcriptCallback(this.transcriptSoFar);
+    }
   }
 }
